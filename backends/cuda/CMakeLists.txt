@@ -335,7 +335,21 @@ endif()
 # appends to any INSTALL_RPATH the caller set rather than replacing it, so a
 # source install keeps its own paths.
 if(EXECUTORCH_BUILD_SHARED)
+  if(_cuda_is_windows_msvc)
+    # In the shared layout the delegate is its own DLL and imports the stream
+    # guard functions (get/set/peek/clearCurrentCUDAStream) from this one. They
+    # carry no AOTI_SHIM_EXPORT, so the annotations alone would not export them;
+    # export everything, as every other shipped DLL does.
+    set_target_properties(
+      aoti_cuda_shims PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON
+    )
+  endif()
   executorch_target_shipped_runtime_path(aoti_cuda_shims)
+  if(_cuda_is_msvc_toolchain)
+    # extension_cuda is linked PRIVATE on MSVC and so brings no runtime; resolve
+    # it from the shared library rather than the static core cuda_platform uses.
+    executorch_target_link_shared_runtime(aoti_cuda_shims)
+  endif()
 endif()
 
 install(
