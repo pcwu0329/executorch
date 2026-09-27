@@ -13,7 +13,7 @@ assert_io_compatible` compares the two *before* compilation and fails loudly.
 """
 
 import logging
-from typing import Any, List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from executorch.backends.apple.coreai.compiler.constants import MAIN_ENTRYPOINT
@@ -180,7 +180,32 @@ def io_mismatches(
     return errors
 
 
-def assert_io_compatible(program, edge_program: ExportedProgram) -> None:
+def coreai_io_names(program) -> Tuple[List[str], List[str]]:
+    """Read names in graph argument/result order, never dictionary order."""
+    graph = program._get_graph(MAIN_ENTRYPOINT)
+    names = []
+    for kind, attrs, types in (
+        ("input", graph.arg_attrs, graph.function_type.value.inputs),
+        ("output", graph.res_attrs, graph.function_type.value.results),
+    ):
+        ordered = [a["coreai.name"].value for a in attrs if "coreai.name" in a]
+        if (
+            len(ordered) != len(types)
+            or any(not name for name in ordered)
+            or len(set(ordered)) != len(ordered)
+        ):
+            raise ValueError(f"Core AI {kind} names must be complete and unique")
+        names.append(ordered)
+    return names[0], names[1]
+
+
+def assert_io_compatible(
+    program,
+    edge_program: ExportedProgram,
+    *,
+    input_names: Optional[Sequence[str]] = None,
+    output_names: Optional[Sequence[str]] = None,
+) -> None:
     """Raise if the ``.aimodel`` boundary I/O is incompatible with ExecuTorch."""
     coreai_in, coreai_out = _coreai_io(program)
     edge_in, edge_out = _edge_io(edge_program)
@@ -198,6 +223,17 @@ def assert_io_compatible(program, edge_program: ExportedProgram) -> None:
     errors = io_mismatches(coreai_in, edge_in, "input") + io_mismatches(
         coreai_out, edge_out, "output"
     )
+    if input_names is not None or output_names is not None:
+        actual_inputs, actual_outputs = coreai_io_names(program)
+        for kind, actual, expected in (
+            ("input", actual_inputs, input_names),
+            ("output", actual_outputs, output_names),
+        ):
+            if expected is not None and actual != list(expected):
+                errors.append(
+                    f"{kind} names mismatch: .aimodel has {actual}, "
+                    f"ExecuTorch expects {list(expected)}"
+                )
     if errors:
         raise ValueError(
             "Core AI delegate boundary is incompatible with ExecuTorch:\n  "
