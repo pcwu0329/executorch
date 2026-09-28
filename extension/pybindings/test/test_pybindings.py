@@ -33,6 +33,17 @@ from executorch.extension.pybindings.test.make_test import (
 from torch.export import export
 
 
+class DLPackOnly:
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = array
+
+    def __dlpack__(self, stream=None):
+        return self.array.__dlpack__(stream=stream)
+
+    def __dlpack_device__(self):
+        return self.array.__dlpack_device__()
+
+
 class PybindingsTest(unittest.TestCase):
     def setUp(self):
         # Will test both portable and aten
@@ -74,6 +85,16 @@ class PybindingsTest(unittest.TestCase):
         executorch_module = self.load_fn(exported_program.buffer)
 
         output = executorch_module.forward([value.numpy() for value in inputs])[0]
+
+        self.assertTrue(torch.allclose(output, inputs[0] + inputs[1]))
+
+    def test_dlpack_inputs(self):
+        exported_program, inputs = create_program(ModuleAdd())
+        executorch_module = self.load_fn(exported_program.buffer)
+
+        output = executorch_module.forward(
+            [DLPackOnly(value.numpy()) for value in inputs]
+        )[0]
 
         self.assertTrue(torch.allclose(output, inputs[0] + inputs[1]))
 

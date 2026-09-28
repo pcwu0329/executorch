@@ -14,7 +14,10 @@ Build with `-DEXECUTORCH_PYBIND_USE_ATEN=OFF` to remove the ATen and PyTorch
 library dependency from the bindings. CPU inputs may be NumPy arrays or other
 dense objects implementing Python's buffer protocol. If PyTorch is installed,
 `torch.Tensor` inputs are inspected through their Python attributes; the
-extension does not link against torch.
+extension does not link against torch. Other producers, including CuPy, can
+pass CPU or CUDA storage through DLPack. One invocation must use one tensor
+protocol consistently; buffers, torch tensors, and DLPack-only objects cannot
+be mixed.
 
 Tensor outputs from a torch-free build are result-memory objects. They expose
 shape, strides, dtype, and the Python buffer protocol, so NumPy can read them
@@ -23,6 +26,16 @@ without another copy:
 ```python
 output = module.forward([numpy_input])[0]
 result = np.asarray(output)
+```
+
+`ResultMemory` also implements `__dlpack__` and `__dlpack_device__`. Device
+outputs remain on their original allocation and can be handed to a framework
+without copying:
+
+```python
+x = torch.ones(1, 3, 224, 224, device="cuda")
+output = module.forward([x])[0]
+y = torch.from_dlpack(output)
 ```
 # Link Backends
 
@@ -44,9 +57,8 @@ CMAKE_ARGS="-DEXECUTORCH_BUILD_VULKAN=ON" ./install_executorch.sh
 ## Classes
 ### ExecuTorchModule
 - `plan_execute()`: Plan and execute.
-- `run_method()`: Run a method with either PyTorch tensors or objects that
-  implement Python's buffer protocol, such as NumPy arrays. A call must use a
-  single tensor protocol; PyTorch tensors and buffers cannot be mixed.
+- `run_method()`: Run a method with PyTorch tensors, Python buffer objects such
+  as NumPy arrays, or DLPack producers. A call must use one tensor protocol.
 - `forward()`: Forward. A single buffer may be passed directly; multiple
   inputs are passed as a flat sequence.
 - `has_etdump()`: Check if etdump is available.
