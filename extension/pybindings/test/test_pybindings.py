@@ -22,6 +22,7 @@ from executorch.exir.schema import DeviceType
 from executorch.extension.pybindings.test.make_test import (
     create_program,
     ModuleAdd,
+    ModuleAddBFloat16,
     ModuleAddConstReturn,
     ModuleAddSingleInput,
     ModuleAddWithAttributes,
@@ -98,6 +99,22 @@ class PybindingsTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(output, inputs[0] + inputs[1]))
 
+    def test_bfloat16_raw_buffer_inputs(self):
+        exported_program, inputs = create_program(ModuleAddBFloat16())
+        executorch_module = self.load_fn(exported_program.buffer)
+        raw_inputs = [value.view(torch.uint8).numpy().tobytes() for value in inputs]
+
+        output = executorch_module.forward(raw_inputs)[0]
+
+        self.assertTrue(torch.equal(output, inputs[0] + inputs[1]))
+
+    def test_default_numpy_integer_dtype_error_is_descriptive(self):
+        exported_program, _ = create_program(ModuleAddSingleInput())
+        executorch_module = self.load_fn(exported_program.buffer)
+
+        with self.assertRaisesRegex(ValueError, "dtype Long.*expects Float"):
+            executorch_module(np.ones((2, 2), dtype=int))
+
     def test_numpy_array_is_a_single_input(self):
         exported_program, inputs = create_program(ModuleAddSingleInput())
         executorch_module = self.load_fn(exported_program.buffer)
@@ -106,12 +123,13 @@ class PybindingsTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(output, inputs[0] + inputs[0]))
 
-    def test_mixed_tensor_protocols_are_rejected(self):
+    def test_mixed_tensor_protocols(self):
         exported_program, inputs = create_program(ModuleAdd())
         executorch_module = self.load_fn(exported_program.buffer)
 
-        with self.assertRaisesRegex(TypeError, "cannot mix buffer and torch"):
-            executorch_module.forward([inputs[0], inputs[1].numpy()])
+        output = executorch_module.forward([inputs[0], inputs[1].numpy()])[0]
+
+        self.assertTrue(torch.allclose(output, inputs[0] + inputs[1]))
 
     def test_non_dense_numpy_input_is_rejected(self):
         exported_program, inputs = create_program(ModuleAddSingleInput())
