@@ -453,7 +453,18 @@ class CudaSequenceKVCache final : public cache::SequenceCache,
     }
     metrics_.flat_capacity = new_rows;
     metrics_.growth_count++;
+    // Every program sharing this cache now points at freed storage: drop the
+    // bindings so each rebinds before its next run, and any captured CUDA
+    // graph so it is captured again against the new storage. prefill usually
+    // grows the cache while decode's graph sits idle, so this reaches every
+    // handle, not only the one stepping now.
     bound_.clear();
+    for (auto& entry : descriptors_) {
+      CudaGraphState& graph = entry.first->cuda_graph_state;
+      if (graph.phase == CudaGraphPhase::Replay) {
+        graph.recapture();
+      }
+    }
     ET_LOG(
         Info,
         "offgraph_kv: grew flat_capacity=%lld->%lld allocated_bytes=%lld "

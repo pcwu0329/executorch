@@ -625,3 +625,100 @@ TEST(OffGraphKVStepWidthTest, ReadsTheExtentOfTheNamedInput) {
           .error(),
       Error::InvalidArgument);
 }
+
+TEST_F(CudaKVCacheTest, GrowthDropsACapturedGraphOnlyWhenStorageMoves) {
+  cache::CacheGeometry geometry;
+  geometry.layers = {{{cache::LayerPolicy::Kind::Flat, 0}, kHeads, kDim}};
+  auto cache_ptr = cu::make_cuda_sequence_kv_cache(geometry, config(32, 4, 4));
+  ASSERT_NE(cache_ptr, nullptr);
+  auto& kv = *cache_ptr->as<cu::CudaKVCache>();
+  FakeContainer container{
+      {"flat_k", "flat_v"},
+      {"__et_offgraph_kv_layer_0_k", "__et_offgraph_kv_layer_0_v"},
+      {},
+      0};
+  auto handle = make_handle(container);
+  ASSERT_TRUE(kv.note_handle(&handle).get());
+
+  // A decode graph captured against the initial storage.
+  ASSERT_EQ(kv.prepare_step(3, cudaStreamPerThread), Error::Ok);
+  ASSERT_EQ(kv.rebind_for_execute(&handle), Error::Ok);
+  auto& graph = handle.cuda_graph_state;
+  graph.phase = cu::CudaGraphPhase::Replay;
+  void* static_input = nullptr;
+  ASSERT_EQ(cudaMalloc(&static_input, 16), cudaSuccess);
+  graph.static_input_ptrs = {static_input};
+  graph.static_input_nbytes = {16};
+  ASSERT_EQ(kv.commit_step(3), Error::Ok);
+
+  // Fits the current storage: the graph keeps replaying.
+  ASSERT_EQ(kv.prepare_step(1, cudaStreamPerThread), Error::Ok);
+  EXPECT_EQ(kv.metrics().growth_count, 0);
+  EXPECT_EQ(graph.phase, cu::CudaGraphPhase::Replay);
+  EXPECT_EQ(graph.static_input_ptrs.size(), 1);
+  ASSERT_EQ(kv.commit_step(1), Error::Ok);
+
+  // Grows: the graph points at freed storage, so the growth itself drops it
+  // -- freeing what the capture pinned -- and this very call captures again,
+  // after one eager step that absorbs AOTI's constant fold.
+  ASSERT_EQ(kv.prepare_step(1, cudaStreamPerThread), Error::Ok);
+  ASSERT_EQ(kv.metrics().growth_count, 1);
+  EXPECT_EQ(graph.phase, cu::CudaGraphPhase::Warmup);
+  EXPECT_EQ(graph.warmup_remaining, 1);
+  EXPECT_TRUE(graph.static_input_ptrs.empty());
+  EXPECT_TRUE(graph.static_input_nbytes.empty());
+  EXPECT_EQ(graph.graph_exec, nullptr);
+
+  // Once recaptured, later steps that fit replay it untouched.
+  graph.phase = cu::CudaGraphPhase::Replay;
+  ASSERT_EQ(kv.commit_step(1), Error::Ok);
+  ASSERT_EQ(kv.prepare_step(1, cudaStreamPerThread), Error::Ok);
+  EXPECT_EQ(graph.phase, cu::CudaGraphPhase::Replay);
+  kv.forget_handle(&handle);
+}
+
+TEST_F(CudaKVCacheTest, GrowthDuringAnotherMethodDropsItsGraph) {
+  // Prefill runs eagerly and is where most growth happens, while decode's
+  // graph sits idle. The growth must reach decode too.
+  cache::CacheGeometry geometry;
+  geometry.layers = {{{cache::LayerPolicy::Kind::Flat, 0}, kHeads, kDim}};
+  auto cache_ptr = cu::make_cuda_sequence_kv_cache(geometry, config(64, 4, 16));
+  ASSERT_NE(cache_ptr, nullptr);
+  auto& kv = *cache_ptr->as<cu::CudaKVCache>();
+  auto names = [] {
+    return FakeContainer{
+        {"flat_k", "flat_v"},
+        {"__et_offgraph_kv_layer_0_k", "__et_offgraph_kv_layer_0_v"},
+        {},
+        0};
+  };
+  auto prefill_container = names();
+  auto decode_container = names();
+  auto prefill = make_handle(prefill_container);
+  auto decode = make_handle(decode_container);
+  ASSERT_TRUE(kv.note_handle(&prefill).get());
+  ASSERT_TRUE(kv.note_handle(&decode).get());
+
+  ASSERT_EQ(kv.prepare_step(1, cudaStreamPerThread), Error::Ok);
+  ASSERT_EQ(kv.rebind_for_execute(&decode), Error::Ok);
+  decode.cuda_graph_state.phase = cu::CudaGraphPhase::Replay;
+  void* captured_storage = decode_container.bound["flat_k"].data;
+  ASSERT_EQ(kv.commit_step(1), Error::Ok);
+
+  // Prefill grows the cache; decode is not running.
+  ASSERT_EQ(kv.prepare_step(16, cudaStreamPerThread), Error::Ok);
+  ASSERT_EQ(kv.metrics().growth_count, 1);
+  EXPECT_EQ(decode.cuda_graph_state.phase, cu::CudaGraphPhase::Warmup);
+  EXPECT_EQ(decode.cuda_graph_state.warmup_remaining, 1);
+  // A handle that never captured is left as it was.
+  EXPECT_EQ(prefill.cuda_graph_state.phase, cu::CudaGraphPhase::Disabled);
+  ASSERT_EQ(kv.rebind_for_execute(&prefill), Error::Ok);
+  ASSERT_EQ(kv.commit_step(16), Error::Ok);
+
+  // decode's next run rebinds away from the storage it captured.
+  ASSERT_EQ(kv.prepare_step(1, cudaStreamPerThread), Error::Ok);
+  ASSERT_EQ(kv.rebind_for_execute(&decode), Error::Ok);
+  EXPECT_NE(decode_container.bound["flat_k"].data, captured_storage);
+  kv.forget_handle(&prefill);
+  kv.forget_handle(&decode);
+}
